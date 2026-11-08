@@ -2,14 +2,15 @@ use std::fmt::Display;
 
 use bon::bon;
 use color_eyre::Result;
-use ratatui_textarea::{CursorMove, DataCursor, TextArea};
+use ratatui_textarea::{CursorMove, DataCursor, TextArea, WrapMode};
 use tokio::sync::mpsc::Sender;
 use tui::{
     Frame,
+    buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, TitlePosition},
+    widgets::{Block, Borders, Clear, Paragraph, TitlePosition, Widget},
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -47,6 +48,7 @@ pub struct InputWidget<T: Clone> {
     visual_indicator: Option<VisualValidator>,
     input_suggester: Option<(T, InputSuggester<T>)>,
     suggestion: Option<String>,
+    max_lines: u16,
 }
 
 #[bon]
@@ -59,9 +61,15 @@ impl<T: Clone> InputWidget<T> {
         input_validator: Option<(T, InputValidator<T>)>,
         visual_indicator: Option<VisualValidator>,
         input_suggester: Option<(T, InputSuggester<T>)>,
+        /// Rows the input may grow to before it scrolls. Above 1, long input soft-wraps.
+        #[builder(default = 1)]
+        max_lines: u16,
     ) -> Self {
         let mut input = TextArea::default();
         input.set_cursor_line_style(Style::default());
+        if max_lines > 1 {
+            input.set_wrap_mode(WrapMode::WordOrGlyph);
+        }
 
         Self {
             config,
@@ -73,7 +81,28 @@ impl<T: Clone> InputWidget<T> {
             visual_indicator,
             input_suggester,
             suggestion: None,
+            max_lines,
         }
+    }
+
+    /// Height including borders when drawn `width` columns wide,
+    /// growing with the wrapped input up to `max_lines` rows.
+    pub fn height(&self, width: u16) -> u16 {
+        let inner_width = width.saturating_sub(2);
+        if self.max_lines <= 1 || inner_width == 0 {
+            return 3;
+        }
+
+        // The textarea's wrapped row count isn't public, so render a copy with the cursor
+        // on the last character and see which wrapped row it lands on.
+        let mut probe = self.input.clone();
+        probe.move_cursor(CursorMove::Bottom);
+        probe.move_cursor(CursorMove::End);
+        let area = Rect::new(0, 0, inner_width, 1);
+        (&probe).render(area, &mut Buffer::empty(area));
+
+        let rows = probe.screen_cursor().row as u16 + 1;
+        rows.clamp(1, self.max_lines) + 2
     }
 
     pub fn clear(&mut self) {
@@ -279,21 +308,20 @@ impl<T: Clone> Component for InputWidget<T> {
                 .and_then(|s| s.strip_prefix(text.as_str()))
                 .filter(|s| !s.is_empty())
         {
-            // Only valid after the render above; single line, so just account for horizontal scroll
-            let (_, left) = self.input.scroll_offset();
-            let x = inner.x + (self.input.screen_cursor().col as u16).saturating_sub(left);
+            // Only valid after the render above
+            let cursor = self.input.screen_cursor();
+            let (top, left) = self.input.scroll_offset();
+            let x = inner.x + (cursor.col as u16).saturating_sub(left);
+            let y = inner.y + (cursor.row as u16).saturating_sub(top);
 
-            if x < inner.right() {
+            if x < inner.right() && y < inner.bottom() {
                 let mut chars = rest.chars();
                 let first = chars.next().map_or_default(String::from);
                 let line = Line::from(vec![
                     Span::styled(first, self.input.cursor_style().add_modifier(Modifier::DIM)),
                     Span::styled(chars.as_str(), Style::default().add_modifier(Modifier::DIM)),
                 ]);
-                f.render_widget(
-                    Paragraph::new(line),
-                    Rect::new(x, inner.y, inner.right() - x, 1),
-                );
+                f.render_widget(Paragraph::new(line), Rect::new(x, y, inner.right() - x, 1));
             }
         }
 

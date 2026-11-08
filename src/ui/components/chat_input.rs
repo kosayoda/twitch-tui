@@ -85,6 +85,7 @@ impl ChatInputWidget {
             .input_validator((storage.clone(), input_validator))
             .visual_indicator(visual_indicator)
             .input_suggester((storage.clone(), input_suggester))
+            .max_lines(5)
             .build();
 
         let emote_picker = EmotePickerWidget::new(config.clone(), event_tx.clone(), emotes);
@@ -108,6 +109,12 @@ impl ChatInputWidget {
 
     pub fn toggle_focus_with(&mut self, s: &str) {
         self.input.toggle_focus_with(s);
+    }
+
+    /// Height of the input box within a chat area `width` columns wide.
+    pub fn height(&self, width: u16) -> u16 {
+        self.input
+            .height(width.saturating_sub(self.config.frontend.margin * 2))
     }
 }
 
