@@ -2,14 +2,11 @@ use std::fmt::Display;
 
 use bon::bon;
 use color_eyre::Result;
-use rustyline::{
-    At, Word,
-    line_buffer::{ChangeListener, DeleteListener, LineBuffer},
-};
+use ratatui_textarea::TextArea;
 use tokio::sync::mpsc::Sender;
 use tui::{
     Frame,
-    layout::{Position as LayoutPosition, Rect},
+    layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, TitlePosition},
@@ -19,10 +16,10 @@ use super::popup_area;
 use crate::{
     config::SharedCoreConfig,
     events::{Event, InternalEvent, Key},
-    ui::{components::Component, statics::LINE_BUFFER_CAPACITY},
+    ui::components::Component,
     utils::{
         styles::NO_COLOR,
-        text::{TitleStyle, get_cursor_position, title_line},
+        text::{TitleStyle, title_line},
     },
 };
 
@@ -30,26 +27,12 @@ pub type InputValidator<T> = Box<dyn Fn(T, String) -> bool>;
 pub type VisualValidator = Box<dyn Fn(String) -> String>;
 pub type InputSuggester<T> = Box<dyn Fn(T, String) -> Option<String>>;
 
-#[derive(Debug)]
-pub struct InputListener;
-
-impl ChangeListener for InputListener {
-    fn insert_char(&mut self, _idx: usize, _c: char) {}
-    fn insert_str(&mut self, _idx: usize, _string: &str) {}
-    fn replace(&mut self, _idx: usize, _old: &str, _new: &str) {}
-}
-
-impl DeleteListener for InputListener {
-    fn delete(&mut self, _idx: usize, _string: &str, _dir: rustyline::line_buffer::Direction) {}
-}
-
 pub struct InputWidget<T: Clone> {
     config: SharedCoreConfig,
     event_tx: Sender<Event>,
-    input: LineBuffer,
+    input: TextArea<'static>,
     title: String,
     focused: bool,
-    input_listener: InputListener,
     input_validator: Option<(T, InputValidator<T>)>,
     visual_indicator: Option<VisualValidator>,
     input_suggester: Option<(T, InputSuggester<T>)>,
@@ -67,13 +50,15 @@ impl<T: Clone> InputWidget<T> {
         visual_indicator: Option<VisualValidator>,
         input_suggester: Option<(T, InputSuggester<T>)>,
     ) -> Self {
+        let mut input = TextArea::default();
+        input.set_cursor_line_style(Style::default());
+
         Self {
             config,
             event_tx,
-            input: LineBuffer::with_capacity(LINE_BUFFER_CAPACITY),
+            input,
             title: title.to_string(),
             focused: false,
-            input_listener: InputListener,
             input_validator,
             visual_indicator,
             input_suggester,
@@ -82,7 +67,7 @@ impl<T: Clone> InputWidget<T> {
     }
 
     pub fn clear(&mut self) {
-        self.input.update("", 0, &mut self.input_listener);
+        self.input.clear();
     }
 
     pub const fn is_focused(&self) -> bool {
@@ -95,48 +80,46 @@ impl<T: Clone> InputWidget<T> {
 
     pub fn toggle_focus_with(&mut self, s: &str) {
         self.focused = !self.focused;
-        self.input.update(s, 1, &mut self.input_listener);
+        self.input.clear();
+        self.input.insert_str(s);
     }
 
     pub fn is_valid(&self) -> bool {
         self.input_validator
             .as_ref()
-            .is_none_or(|(items, validator)| validator(items.clone(), self.input.to_string()))
+            .is_none_or(|(items, validator)| {
+                validator(items.clone(), self.input.lines().join("\n"))
+            })
     }
 
     pub fn accept_suggestion(&mut self) {
         if let Some(suggestion) = &self.suggestion {
-            self.input.update(suggestion, 0, &mut self.input_listener);
+            self.input.clear();
+            self.input.insert_str(suggestion);
         }
     }
 
     pub fn insert(&mut self, s: &str) {
-        self.input
-            .insert_str(self.input.pos(), s, &mut self.input_listener);
-        self.input.set_pos(self.input.pos() + s.len());
+        self.input.insert_str(s);
+    }
+
+    fn cursor_at_end(&self) -> bool {
+        let ratatui_textarea::DataCursor(row, col) = self.input.cursor();
+        let lines = self.input.lines();
+        row == lines.len() - 1 && col == lines[row].chars().count()
     }
 }
 
 impl<T: Clone> Display for InputWidget<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.input.as_str())
+        write!(f, "{}", self.input.lines().join("\n"))
     }
 }
 
 impl<T: Clone> Component for InputWidget<T> {
     fn draw(&mut self, f: &mut Frame, area: Option<Rect>) -> Result<()> {
         let r = area.map_or_else(|| popup_area(f.area(), 60, 60), |a| a.clamp(f.area()));
-
-        let cursor_pos = get_cursor_position(&self.input);
-
-        f.set_cursor_position(LayoutPosition::new(
-            (r.x + cursor_pos as u16 + 1).min(r.x + r.width.saturating_sub(2)),
-            r.y + 1,
-        ));
-
-        let current_input = self.input.as_str();
-
-        let binding = [TitleStyle::Single(&self.title)];
+        let text = self.input.lines().join("\n");
 
         let status_color = if self.is_valid() {
             Color::Green
@@ -147,51 +130,55 @@ impl<T: Clone> Component for InputWidget<T> {
         self.suggestion = self
             .input_suggester
             .as_ref()
-            .and_then(|(items, suggester)| suggester(items.clone(), self.input.to_string()));
+            .and_then(|(items, suggester)| suggester(items.clone(), text.clone()));
+
+        let binding = [TitleStyle::Single(&self.title)];
+        let title_style = if *NO_COLOR {
+            Style::default()
+        } else {
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD)
+        };
 
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(self.config.frontend.border_type.clone().into())
             .border_style(Style::default().fg(status_color))
-            .title(title_line(
-                &binding,
-                if *NO_COLOR {
-                    Style::default()
-                } else {
-                    Style::default()
-                        .fg(status_color)
-                        .add_modifier(Modifier::BOLD)
-                },
-            ));
-
-        let paragraph_lines = Line::from(vec![
-            Span::raw(current_input),
-            Span::styled(
-                self.suggestion
-                    .as_ref()
-                    .map_or_else(String::new, |suggestion_buffer| {
-                        if suggestion_buffer.len() > current_input.len() {
-                            suggestion_buffer
-                                .get(current_input.len()..)
-                                .unwrap_or_default()
-                                .to_string()
-                        } else {
-                            String::new()
-                        }
-                    }),
-                Style::default().add_modifier(Modifier::DIM),
-            ),
-        ]);
-
-        let paragraph = Paragraph::new(paragraph_lines)
-            .block(block)
-            .scroll((0, ((cursor_pos + 3) as u16).saturating_sub(r.width)));
+            .title(title_line(&binding, title_style));
+        let inner = block.inner(r);
 
         f.render_widget(Clear, r);
-        f.render_widget(paragraph, r);
+        f.render_widget(block, r);
+        f.render_widget(&self.input, inner);
+
+        if self.cursor_at_end()
+            && let Some(rest) = self
+                .suggestion
+                .as_deref()
+                .and_then(|s| s.strip_prefix(text.as_str()))
+                .filter(|s| !s.is_empty())
+        {
+            // Only valid after the render above; single line, so just account for horizontal scroll
+            let (_, left) = self.input.scroll_offset();
+            let x = inner.x + (self.input.screen_cursor().col as u16).saturating_sub(left);
+
+            if x < inner.right() {
+                let mut chars = rest.chars();
+                let first = chars.next().map(String::from).unwrap_or_default();
+                let line = Line::from(vec![
+                    Span::styled(first, self.input.cursor_style().add_modifier(Modifier::DIM)),
+                    Span::styled(chars.as_str(), Style::default().add_modifier(Modifier::DIM)),
+                ]);
+                f.render_widget(
+                    Paragraph::new(line),
+                    Rect::new(x, inner.y, inner.right() - x, 1),
+                );
+            }
+        }
 
         if let Some(visual) = &self.visual_indicator {
-            let contents = visual(self.input.to_string());
+            let contents = visual(text);
 
             let title = [TitleStyle::Single(&contents)];
 
@@ -224,54 +211,57 @@ impl<T: Clone> Component for InputWidget<T> {
             let keybinds = &self.config.keybinds.insert;
             match key {
                 key if keybinds.move_cursor_right.contains(key) => {
-                    if self.input.next_pos(1).is_none() {
+                    if self.cursor_at_end() {
                         self.accept_suggestion();
-                        self.input.move_end();
+                        self.input.move_cursor(ratatui_textarea::CursorMove::End);
                     } else {
-                        self.input.move_forward(1);
+                        self.input
+                            .move_cursor(ratatui_textarea::CursorMove::Forward);
                     }
                 }
                 key if keybinds.move_cursor_left.contains(key) => {
-                    self.input.move_backward(1);
+                    self.input.move_cursor(ratatui_textarea::CursorMove::Back);
                 }
                 key if keybinds.move_cursor_start.contains(key) => {
-                    self.input.move_home();
+                    self.input.move_cursor(ratatui_textarea::CursorMove::Head);
                 }
                 key if keybinds.move_cursor_end.contains(key) => {
-                    self.input.move_end();
+                    self.input.move_cursor(ratatui_textarea::CursorMove::End);
                 }
                 key if keybinds.end_of_next_word.contains(key) => {
-                    self.input.move_to_next_word(At::AfterEnd, Word::Emacs, 1);
+                    self.input
+                        .move_cursor(ratatui_textarea::CursorMove::WordEnd);
                 }
                 key if keybinds.start_of_previous_word.contains(key) => {
-                    self.input.move_to_prev_word(Word::Emacs, 1);
+                    self.input
+                        .move_cursor(ratatui_textarea::CursorMove::WordBack);
                 }
                 key if keybinds.swap_previous_item_with_current.contains(key) => {
-                    self.input.transpose_chars(&mut self.input_listener);
+                    // TODO: ratatui-textarea has no native transpose_chars, so we have to implement
+                    // that ourselves
                 }
                 key if keybinds.swap_previous_word_with_current.contains(key) => {
-                    self.input.transpose_words(1, &mut self.input_listener);
+                    // TODO: ratatui-textarea has no native transpose_chars, so we have to implement
+                    // that ourselves
                 }
                 key if keybinds.remove_before_cursor.contains(key) => {
-                    self.input.discard_line(&mut self.input_listener);
+                    self.input.delete_line_by_head();
                 }
                 key if keybinds.remove_after_cursor.contains(key) => {
-                    self.input.kill_line(&mut self.input_listener);
+                    self.input.delete_line_by_end();
                 }
                 key if keybinds.remove_previous_word.contains(key) => {
-                    self.input
-                        .delete_prev_word(Word::Emacs, 1, &mut self.input_listener);
+                    self.input.delete_word();
                 }
                 key if keybinds.remove_item_to_right.contains(key) => {
-                    self.input.delete(1, &mut self.input_listener);
+                    self.input.delete_next_word();
                 }
                 Key::Backspace => {
-                    self.input.backspace(1, &mut self.input_listener);
+                    self.input.delete_char();
                 }
                 key if keybinds.fill_suggestion.contains(key) => {
                     if let Some(suggestion) = &self.suggestion {
-                        self.input
-                            .update(suggestion, suggestion.len(), &mut self.input_listener);
+                        self.input.insert_str(suggestion);
                     }
                 }
                 key if keybinds.quit.contains(key) => {
@@ -280,7 +270,7 @@ impl<T: Clone> Component for InputWidget<T> {
                         .await?;
                 }
                 Key::Char(c) => {
-                    self.input.insert(*c, 1, &mut self.input_listener);
+                    self.input.insert_char(*c);
                 }
                 _ => {}
             }
