@@ -46,6 +46,7 @@ webbrowser = "1.0.4"
 memchr = "2.7.4"
 bon = "3.8.2"
 directories = "6.0.0"
+ratatui-textarea = "0.9.4"
 
 [target.'cfg(not(windows))'.dependencies]
 tui = { package = "ratatui", version = "0.30.0", default-features = false, features = [
