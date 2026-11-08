@@ -3,7 +3,7 @@ name = "twitch-tui"
 version = "3.0.0-alpha.4"
 authors = ["Xithrius <xithrius@gmail.com>"]
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.99.1"
 description = "Twitch chat in the terminal."
 documentation = "https://github.com/Xithrius/twitch-tui"
 repository = "https://github.com/Xithrius/twitch-tui"
@@ -13,10 +13,10 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 tokio = { version = "1.44.2", features = [
-    "rt",
-    "macros",
-    "rt-multi-thread",
-    "fs",
+  "rt",
+  "macros",
+  "rt-multi-thread",
+  "fs",
 ] }
 tokio-tungstenite = { version = "0.26.2", features = ["native-tls"] }
 clap = { version = "4.5.37", features = ["derive", "cargo"] }
@@ -35,7 +35,7 @@ fuzzy-matcher = "0.3.7"
 regex = "1.11.1"
 color-eyre = "0.6.3"
 dialoguer = { version = "0.11.0", default-features = false, features = [
-    "password",
+  "password",
 ] }
 reqwest = { version = "0.12.15", features = ["json"] }
 image = "0.25.6"
@@ -49,15 +49,15 @@ directories = "6.0.0"
 
 [target.'cfg(not(windows))'.dependencies]
 tui = { package = "ratatui", version = "0.30.0", default-features = false, features = [
-    "crossterm",
-    "serde",
-    "underline-color",
+  "crossterm",
+  "serde",
+  "underline-color",
 ] }
 
 [target.'cfg(windows)'.dependencies]
 tui = { package = "ratatui", version = "0.30.0", default-features = false, features = [
-    "crossterm",
-    "serde",
+  "crossterm",
+  "serde",
 ] }
 
 [[bin]]
