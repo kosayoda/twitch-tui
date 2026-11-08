@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use bon::bon;
 use color_eyre::Result;
-use ratatui_textarea::TextArea;
+use ratatui_textarea::{CursorMove, DataCursor, TextArea};
 use tokio::sync::mpsc::Sender;
 use tui::{
     Frame,
@@ -11,6 +11,7 @@ use tui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, TitlePosition},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use super::popup_area;
 use crate::{
@@ -26,6 +27,15 @@ use crate::{
 pub type InputValidator<T> = Box<dyn Fn(T, String) -> bool>;
 pub type VisualValidator = Box<dyn Fn(String) -> String>;
 pub type InputSuggester<T> = Box<dyn Fn(T, String) -> Option<String>>;
+
+/// Char column of grapheme index `idx`.
+#[expect(
+    clippy::indexing_slicing,
+    reason = "callers pass idx + 1 or w2_end, which are never past graphemes.len()"
+)]
+fn char_col(graphemes: &[&str], idx: usize) -> usize {
+    graphemes[..idx].iter().map(|g| g.chars().count()).sum()
+}
 
 pub struct InputWidget<T: Clone> {
     config: SharedCoreConfig,
@@ -104,9 +114,119 @@ impl<T: Clone> InputWidget<T> {
     }
 
     fn cursor_at_end(&self) -> bool {
-        let ratatui_textarea::DataCursor(row, col) = self.input.cursor();
+        let DataCursor(row, col) = self.input.cursor();
         let lines = self.input.lines();
-        row == lines.len() - 1 && col == lines[row].chars().count()
+        row + 1 == lines.len() && lines.get(row).is_some_and(|l| col == l.chars().count())
+    }
+
+    /// Graphemes of the cursor's current line, and the cursor as a grapheme index.
+    ///
+    /// If mid-grapheme, the index is rounded down.
+    fn line_graphemes(&self) -> (Vec<&str>, usize) {
+        let DataCursor(row, col) = self.input.cursor();
+        let graphemes: Vec<&str> = self
+            .input
+            .lines()
+            .get(row)
+            .map_or_default(|l| l.graphemes(true).collect());
+
+        let mut chars = 0;
+        let idx = graphemes
+            .iter()
+            .take_while(|g| {
+                chars += g.chars().count();
+                chars <= col
+            })
+            .count();
+
+        (graphemes, idx)
+    }
+
+    /// Replace the cursor's line with `new` and put the cursor at `col`, keeping the yank buffer intact.
+    fn replace_current_line(&mut self, new: &str, col: usize) {
+        let row = self.input.cursor().0;
+        let yank = self.input.yank_text();
+
+        self.input.move_cursor(CursorMove::Head);
+        self.input.delete_line_by_end();
+        self.input.insert_str(new);
+        self.input
+            .move_cursor(CursorMove::Jump(row as u16, col as u16));
+
+        self.input.set_yank_text(yank);
+    }
+
+    fn transpose_chars(&mut self) {
+        let (mut g, mut idx) = self.line_graphemes();
+
+        if idx == 0 || g.len() < 2 {
+            return;
+        }
+        // At the end of the line, swap the last two graphemes instead
+        if idx == g.len() {
+            idx -= 1;
+        }
+
+        g.swap(idx - 1, idx);
+        let col = char_col(&g, idx + 1);
+        let new = g.concat();
+        self.replace_current_line(&new, col);
+    }
+
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "indexing is guarded by the loop conditions, and slice bounds are ordered w1_beg <= w1_end <= w2_beg <= w2_end <= len"
+    )]
+    fn transpose_words(&mut self) {
+        let (graphemes, idx) = self.line_graphemes();
+
+        let is_word = |s: &str| s.chars().next().is_some_and(char::is_alphanumeric);
+        let word_end = |mut i: usize| {
+            while i < graphemes.len() && is_word(graphemes[i]) {
+                i += 1;
+            }
+            i
+        };
+        let prev_word_start = |mut i: usize| {
+            while i > 0 && !is_word(graphemes[i - 1]) {
+                i -= 1;
+            }
+            while i > 0 && is_word(graphemes[i - 1]) {
+                i -= 1;
+            }
+            i
+        };
+
+        // Second word: the one under/after the cursor, or the last one before it
+        let mut i = idx;
+        while i < graphemes.len() && !is_word(graphemes[i]) {
+            i += 1;
+        }
+        let w2_beg = prev_word_start(word_end(i));
+        let w2_end = word_end(w2_beg);
+
+        // First word: the one before that
+        let w1_beg = prev_word_start(w2_beg);
+        let w1_end = word_end(w1_beg);
+
+        // No second word, or only punctuation before it (`prev_word_start` then stops at 0 without finding a word)
+        if w1_beg == w2_beg || w1_beg == w1_end {
+            return;
+        }
+
+        let swapped = [
+            &graphemes[..w1_beg],
+            &graphemes[w2_beg..w2_end],
+            &graphemes[w1_end..w2_beg],
+            &graphemes[w1_beg..w1_end],
+            &graphemes[w2_end..],
+        ]
+        .concat();
+
+        // Same grapheme count, but char counts per position changed, so compute the column on the new order
+        let col = char_col(&swapped, w2_end);
+        let new = swapped.concat();
+        self.replace_current_line(&new, col);
     }
 }
 
@@ -165,7 +285,7 @@ impl<T: Clone> Component for InputWidget<T> {
 
             if x < inner.right() {
                 let mut chars = rest.chars();
-                let first = chars.next().map(String::from).unwrap_or_default();
+                let first = chars.next().map_or_default(String::from);
                 let line = Line::from(vec![
                     Span::styled(first, self.input.cursor_style().add_modifier(Modifier::DIM)),
                     Span::styled(chars.as_str(), Style::default().add_modifier(Modifier::DIM)),
@@ -237,12 +357,10 @@ impl<T: Clone> Component for InputWidget<T> {
                         .move_cursor(ratatui_textarea::CursorMove::WordBack);
                 }
                 key if keybinds.swap_previous_item_with_current.contains(key) => {
-                    // TODO: ratatui-textarea has no native transpose_chars, so we have to implement
-                    // that ourselves
+                    self.transpose_chars();
                 }
                 key if keybinds.swap_previous_word_with_current.contains(key) => {
-                    // TODO: ratatui-textarea has no native transpose_chars, so we have to implement
-                    // that ourselves
+                    self.transpose_words();
                 }
                 key if keybinds.remove_before_cursor.contains(key) => {
                     self.input.delete_line_by_head();
